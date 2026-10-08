@@ -37,3 +37,4 @@ venv.bak/
 .idea/
 .DS_Store
 Thumbs.db
+powershell.cmd
