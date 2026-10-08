@@ -225,7 +225,6 @@ def smart_normalize_columns(df_in):
 @st.cache_data(show_spinner="Loading benchmark dataset...")
 def load_benchmark_data():
     """Loads the core benchmark 10,000 record dataset safely across all environments."""
-    # 1. Direct path in script directory (Streamlit Cloud safe)
     candidate_paths = [
         os.path.join(BASE_DIR, "Student_Performance.csv"),
         "Student_Performance.csv",
@@ -236,7 +235,6 @@ def load_benchmark_data():
         if os.path.exists(p):
             return pd.read_csv(p)
 
-    # 2. Search local CSVs
     for f in glob.glob(os.path.join(BASE_DIR, "*.csv")) + glob.glob("*.csv"):
         fname = os.path.basename(f).lower()
         if "template" not in fname and "prediction" not in fname and "sample" not in fname:
@@ -247,7 +245,7 @@ def load_benchmark_data():
             except Exception:
                 continue
 
-    # 3. Built-in synthetic fallback (Guarantees zero-crash even if files disappear)
+    # Built-in synthetic fallback (Guarantees zero-crash even if files disappear)
     np.random.seed(42)
     n = 2000
     h = np.random.randint(1, 10, n)
@@ -311,33 +309,35 @@ def process_dataset(uploaded_file=None):
 
 
 def preprocess_data(df_in):
-    """Cleans dataset, coerces numeric fields, and creates derived features."""
+    """
+    Cleans dataset, enforces 100% strict numeric types on all feature columns,
+    and creates derived features without leaving string or object types.
+    """
     if df_in is None or len(df_in) == 0:
         df_in = load_benchmark_data()
 
     df = df_in.copy().drop_duplicates()
 
-    # Clean Extracurricular Activities
+    # 1. Clean Extracurricular Activities unconditionally (regardless of string/object/category dtype)
     if "Extracurricular Activities" in df.columns:
-        if df["Extracurricular Activities"].dtype == object:
-            df["Extracurricular Activities"] = (
-                df["Extracurricular Activities"].astype(str).str.strip().str.lower()
-                .map({"yes": 1, "no": 0, "1": 1, "0": 0, "true": 1, "false": 0, "y": 1, "n": 0})
-                .fillna(0).astype(int)
-            )
+        s_cleaned = df["Extracurricular Activities"].astype(str).str.strip().str.lower()
+        mapping = {"yes": 1, "no": 0, "1": 1, "0": 0, "true": 1, "false": 0, "y": 1, "n": 0}
+        df["Extracurricular Activities"] = s_cleaned.map(mapping).fillna(0).astype(int)
 
-    # Coerce numeric features safely
+    # 2. Coerce numeric features safely to pure numbers
     for col in FEATURE_COLS:
         if col in df.columns and col != "Extracurricular Activities":
             df[col] = pd.to_numeric(df[col], errors="coerce")
-            df[col] = df[col].fillna(df[col].median() if not df[col].isna().all() else 0)
+            median_val = float(df[col].median()) if not df[col].dropna().empty else 0.0
+            df[col] = df[col].fillna(median_val)
 
-    # Coerce target if present
+    # 3. Coerce target if present
     if TARGET in df.columns:
         df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
         df = df.dropna(subset=[TARGET])
         if len(df) == 0:
-            return load_benchmark_data()
+            df = load_benchmark_data()
+            return preprocess_data(df)
 
         bins = [-1, 40, 60, 75, 90, 101]
         labels = [
@@ -357,17 +357,36 @@ def preprocess_data(df_in):
 # ==========================================
 def train_and_evaluate(df_clean, test_size=0.25, seed=42):
     """
-    Trains Multiple Linear Regression along with:
-    - Analytical 95% Prediction Interval matrices (XtX_inv, MSE)
+    Trains Multiple Linear Regression with strict float64 array conversion:
+    - Never passes raw string/object pandas series to sklearn fit()
+    - Calculates analytical 95% Prediction Interval matrices (XtX_inv, MSE)
     - Variance Inflation Factor (VIF) for Multicollinearity audit
     - Standardized Beta Coefficients (effect size in standard deviations)
     - Ridge, Lasso & Random Forest benchmarks
     """
-    x = df_clean[FEATURE_COLS]
-    y = df_clean[TARGET]
+    df_safe = df_clean.copy()
+
+    # Force clean all columns again unconditionally
+    for col in FEATURE_COLS:
+        if col == "Extracurricular Activities":
+            s_cleaned = df_safe[col].astype(str).str.strip().str.lower()
+            mapping = {"yes": 1, "no": 0, "1": 1, "0": 0, "true": 1, "false": 0, "y": 1, "n": 0}
+            df_safe[col] = s_cleaned.map(mapping).fillna(0).astype(int)
+        else:
+            df_safe[col] = pd.to_numeric(df_safe[col], errors="coerce").fillna(0.0)
+
+    df_safe[TARGET] = pd.to_numeric(df_safe[TARGET], errors="coerce")
+    df_safe = df_safe.dropna(subset=[TARGET])
+
+    if len(df_safe) < 10:
+        df_safe = preprocess_data(load_benchmark_data())
+
+    # Explicit 2D float64 numpy array (Zero chance of ValueError string to float)
+    x_array = df_safe[FEATURE_COLS].to_numpy(dtype=np.float64)
+    y_array = df_safe[TARGET].to_numpy(dtype=np.float64)
 
     x_train, x_test, y_train, y_test = train_test_split(
-        x, y, test_size=test_size, random_state=int(seed)
+        x_array, y_array, test_size=test_size, random_state=int(seed)
     )
 
     # Main Multiple Linear Regression model
@@ -376,9 +395,8 @@ def train_and_evaluate(df_clean, test_size=0.25, seed=42):
     y_pred_train = lr_model.predict(x_train)
 
     # Analytical Prediction Interval Setup
-    # Design matrix with constant 1 column for intercept
-    X_design = np.hstack([np.ones((len(x_train), 1)), x_train.values])
-    mse_train = np.sum((y_train.values - y_pred_train)**2) / max(1, (len(y_train) - X_design.shape[1]))
+    X_design = np.hstack([np.ones((len(x_train), 1)), x_train])
+    mse_train = np.sum((y_train - y_pred_train)**2) / max(1, (len(y_train) - X_design.shape[1]))
     XtX_inv = np.linalg.pinv(X_design.T @ X_design)
 
     # Performance metrics
@@ -398,7 +416,7 @@ def train_and_evaluate(df_clean, test_size=0.25, seed=42):
     }
 
     # Variance Inflation Factor (VIF) Calculation
-    corr_matrix = x.corr().values
+    corr_matrix = np.corrcoef(x_array, rowvar=False)
     vif_values = np.diag(np.linalg.pinv(corr_matrix))
     vif_df = pd.DataFrame({
         "Feature": FEATURE_COLS,
@@ -407,8 +425,8 @@ def train_and_evaluate(df_clean, test_size=0.25, seed=42):
     })
 
     # Standardized Beta Coefficients: beta_std = beta * (std(x) / std(y))
-    std_x = x.std().values
-    std_y = max(0.0001, y.std())
+    std_x = np.std(x_array, axis=0)
+    std_y = max(0.0001, np.std(y_array))
     std_beta = lr_model.coef_ * (std_x / std_y)
 
     coef_df = pd.DataFrame({
@@ -419,7 +437,7 @@ def train_and_evaluate(df_clean, test_size=0.25, seed=42):
         "Impact_Rank": np.argsort(np.argsort(-np.abs(std_beta))) + 1,
     }).sort_values(by="Abs_Coefficient", ascending=False)
 
-    # Benchmark models for model comparison tab
+    # Benchmark models
     models_comparison = {
         "Multiple Linear Regression": {
             "model": lr_model,
@@ -429,7 +447,6 @@ def train_and_evaluate(df_clean, test_size=0.25, seed=42):
         }
     }
 
-    # Ridge
     try:
         ridge = Ridge(alpha=1.0).fit(x_train, y_train)
         ridge_preds = ridge.predict(x_test)
@@ -442,7 +459,6 @@ def train_and_evaluate(df_clean, test_size=0.25, seed=42):
     except Exception:
         pass
 
-    # Lasso
     try:
         lasso = Lasso(alpha=0.1).fit(x_train, y_train)
         lasso_preds = lasso.predict(x_test)
@@ -455,9 +471,8 @@ def train_and_evaluate(df_clean, test_size=0.25, seed=42):
     except Exception:
         pass
 
-    # Fast Random Forest sample
     try:
-        rf = RandomForestRegressor(n_estimators=40, max_depth=8, random_state=int(seed), n_jobs=-1).fit(
+        rf = RandomForestRegressor(n_estimators=35, max_depth=8, random_state=int(seed), n_jobs=-1).fit(
             x_train, y_train
         )
         rf_preds = rf.predict(x_test)
@@ -490,14 +505,13 @@ def train_and_evaluate(df_clean, test_size=0.25, seed=42):
 
 def calculate_prediction_interval(x_vector, interval_params):
     """Computes exact 95% Prediction Interval for a given input feature vector."""
-    x_input = np.array([1.0] + list(x_vector))
+    x_input = np.array([1.0] + list(x_vector), dtype=np.float64)
     mse = interval_params["mse"]
     XtX_inv = interval_params["XtX_inv"]
     variance_pred = mse * (1.0 + float(x_input @ XtX_inv @ x_input))
     se_pred = np.sqrt(max(0.0001, variance_pred))
 
-    # Point prediction
-    raw_pred = float(interval_params["intercept"] + np.dot(x_vector, interval_params["coef"]))
+    raw_pred = float(interval_params["intercept"] + np.dot(np.array(x_vector, dtype=np.float64), interval_params["coef"]))
     lower_95 = max(0.0, raw_pred - 1.96 * se_pred)
     upper_95 = min(100.0, raw_pred + 1.96 * se_pred)
     clamped_pred = max(0.0, min(100.0, raw_pred))
@@ -546,7 +560,7 @@ with st.sidebar:
         """
         <div style='font-size: 0.8rem; opacity: 0.7;'>
         <b>EduPredict Suite</b><br>
-        Multiple Linear Regression · Python 3.13<br>
+        Multiple Linear Regression · Python 3.14<br>
         Engineered for Academic Analytics
         </div>
         """,
@@ -560,16 +574,29 @@ with st.sidebar:
 df_loaded, data_status, file_name, extra_info = process_dataset(uploaded)
 df = preprocess_data(df_loaded)
 
-# Train models with econometric diagnostics
-(
-    model,
-    metrics,
-    coef_df,
-    vif_df,
-    benchmark_dict,
-    interval_params,
-    (X_train, X_test, y_train, y_test, y_pred_test),
-) = train_and_evaluate(df, test_size=test_size_val, seed=random_seed)
+# Train models with double-layer fallback to guarantee 0-crash
+try:
+    (
+        model,
+        metrics,
+        coef_df,
+        vif_df,
+        benchmark_dict,
+        interval_params,
+        (X_train, X_test, y_train, y_test, y_pred_test),
+    ) = train_and_evaluate(df, test_size=test_size_val, seed=random_seed)
+except Exception as train_err:
+    st.warning(f"Notice: Model training on custom inputs encountered an issue: {train_err}. Reverting to standard benchmark model.")
+    df = preprocess_data(load_benchmark_data())
+    (
+        model,
+        metrics,
+        coef_df,
+        vif_df,
+        benchmark_dict,
+        interval_params,
+        (X_train, X_test, y_train, y_test, y_pred_test),
+    ) = train_and_evaluate(df, test_size=test_size_val, seed=random_seed)
 
 # Filtered dataset for overview tab
 df_filtered = df.copy()
@@ -821,7 +848,7 @@ with tab_overview:
         with cs_col2:
             add_papers = st.slider("➕ Weekly Mock Papers Practiced", min_value=0, max_value=5, value=2, step=1)
 
-        sim_scores = df_filtered[TARGET] + (add_study_hours * model.coef_[0]) + (add_papers * model.coef_[4])
+        sim_scores = df_filtered[TARGET] + (add_study_hours * float(model.coef_[0])) + (add_papers * float(model.coef_[4]))
         sim_scores = np.clip(sim_scores, 0.0, 100.0)
 
         sim_df = pd.DataFrame({
@@ -1129,12 +1156,9 @@ Generated On: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
                 st.success(f"Processing {len(batch_clean)} student records for bulk inference!")
 
                 if "Extracurricular Activities" in batch_clean.columns:
-                    if batch_clean["Extracurricular Activities"].dtype == object:
-                        batch_clean["Extracurricular Activities"] = (
-                            batch_clean["Extracurricular Activities"].astype(str).str.strip().str.lower()
-                            .map({"yes": 1, "no": 0, "1": 1, "0": 0, "true": 1, "false": 0, "y": 1, "n": 0})
-                            .fillna(0).astype(int)
-                        )
+                    s_clean_batch = batch_clean["Extracurricular Activities"].astype(str).str.strip().str.lower()
+                    map_batch = {"yes": 1, "no": 0, "1": 1, "0": 0, "true": 1, "false": 0, "y": 1, "n": 0}
+                    batch_clean["Extracurricular Activities"] = s_clean_batch.map(map_batch).fillna(0).astype(int)
 
                 for c in FEATURE_COLS:
                     if c in batch_clean.columns and c != "Extracurricular Activities":
@@ -1144,7 +1168,7 @@ Generated On: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
                 if missing:
                     st.error(f"Missing required columns in CSV: {missing}")
                 else:
-                    batch_preds = model.predict(batch_clean[FEATURE_COLS])
+                    batch_preds = model.predict(batch_clean[FEATURE_COLS].to_numpy(dtype=np.float64))
                     batch_clean["Predicted Performance Index"] = np.clip(batch_preds, 0.0, 100.0).round(2)
 
                     st.dataframe(batch_clean.head(25), width="stretch")
@@ -1274,8 +1298,8 @@ with tab_diagnostics:
                 opacity=0.45,
                 color_discrete_sequence=["#6366F1"],
             )
-            min_val = min(eval_sample["Actual"].min(), eval_sample["Predicted"].min())
-            max_val = max(eval_sample["Actual"].max(), eval_sample["Predicted"].max())
+            min_val = min(float(eval_sample["Actual"].min()), float(eval_sample["Predicted"].min()))
+            max_val = max(float(eval_sample["Actual"].max()), float(eval_sample["Predicted"].max()))
             fig_avp.add_shape(
                 type="line",
                 x0=min_val,
